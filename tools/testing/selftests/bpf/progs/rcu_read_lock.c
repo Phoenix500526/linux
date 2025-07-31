@@ -6,6 +6,7 @@
 #include <bpf/bpf_tracing.h>
 #include "bpf_tracing_net.h"
 #include "bpf_misc.h"
+#include "bpf_kfuncs.h"
 
 char _license[] SEC("license") = "GPL";
 

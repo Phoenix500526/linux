@@ -2,6 +2,7 @@
 #define __BPF_KFUNCS__
 
 struct bpf_sock_addr_kern;
+struct bpf_res_spin_lock;
 
 /* Description
  *  Initializes an skb-type dynptr
@@ -42,6 +43,28 @@ extern bool bpf_dynptr_is_null(const struct bpf_dynptr *ptr) __ksym __weak;
 extern bool bpf_dynptr_is_rdonly(const struct bpf_dynptr *ptr) __ksym __weak;
 extern __u32 bpf_dynptr_size(const struct bpf_dynptr *ptr) __ksym __weak;
 extern int bpf_dynptr_clone(const struct bpf_dynptr *ptr, struct bpf_dynptr *clone__init) __ksym __weak;
+extern int bpf_dynptr_copy(struct bpf_dynptr *dst_ptr, __u32 dst_off, struct bpf_dynptr *src_ptr,
+				__u32 src_off, __u32 size) __ksym __weak;
+extern int bpf_probe_read_user_dynptr(struct bpf_dynptr *dptr, __u32 off,
+				__u32 size, const void *unsafe_ptr__ign) __ksym __weak;
+extern int bpf_probe_read_kernel_dynptr(struct bpf_dynptr *dptr, __u32 off,
+				__u32 size, const void *unsafe_ptr__ign) __ksym __weak;
+extern int bpf_probe_read_user_str_dynptr(struct bpf_dynptr *dptr, __u32 off,
+				__u32 size, const void *unsafe_ptr__ign) __ksym __weak;
+extern int bpf_probe_read_kernel_str_dynptr(struct bpf_dynptr *dptr, __u32 off,
+				__u32 size, const void *unsafe_ptr__ign) __ksym __weak;
+extern int bpf_copy_from_user_dynptr(struct bpf_dynptr *dptr, __u32 off,
+				__u32 size, const void *unsafe_ptr__ign) __ksym __weak;
+extern int bpf_copy_from_user_str_dynptr(struct bpf_dynptr *dptr, __u32 off,
+				__u32 size, const void *unsafe_ptr__ign) __ksym __weak;
+extern int bpf_copy_from_user_task_dynptr(struct bpf_dynptr *dptr, __u32 off,
+				__u32 size, const void *unsafe_ptr__ign,
+				struct task_struct *tsk) __ksym __weak;
+extern int bpf_copy_from_user_task_str_dynptr(struct bpf_dynptr *dptr, __u32 off,
+				__u32 size, const void *unsafe_ptr__ign,
+				struct task_struct *tsk) __ksym __weak;
+extern int bpf_copy_from_user_task_str(void *dst, __u32, const void *,
+				struct task_struct *, __u64) __ksym __weak;
 
 /* Description
  *  Modify the address of a AF_UNIX sockaddr.
@@ -91,5 +114,47 @@ extern int bpf_get_dentry_xattr(struct dentry *dentry, const char *name,
 extern int bpf_set_dentry_xattr(struct dentry *dentry, const char *name__str,
 				const struct bpf_dynptr *value_p, int flags) __ksym __weak;
 extern int bpf_remove_dentry_xattr(struct dentry *dentry, const char *name__str) __ksym __weak;
+
+extern void bpf_local_irq_save(unsigned long *) __ksym __weak;
+extern void bpf_local_irq_restore(unsigned long *) __ksym __weak;
+extern int bpf_copy_from_user_str(void *dst, __u32 dst__sz,
+				const void *unsafe_ptr__ign, __u64 flags) __ksym __weak;
+extern int bpf_res_spin_lock_irqsave(struct bpf_res_spin_lock *lock,
+				unsigned long *flags__irq_flag) __ksym __weak;
+extern void bpf_res_spin_unlock_irqrestore(struct bpf_res_spin_lock *lock,
+				unsigned long *flags__irq_flag) __ksym __weak;
+extern int bpf_res_spin_lock(struct bpf_res_spin_lock *lock) __ksym __weak;
+extern void bpf_res_spin_unlock(struct bpf_res_spin_lock *lock) __ksym __weak;
+
+extern struct bpf_list_node *bpf_list_front(struct bpf_list_head *head) __ksym __weak;
+extern struct bpf_list_node *bpf_list_back(struct bpf_list_head *head) __ksym __weak;
+
+struct bpf_sk_buff_ptr;
+struct sk_buff;
+struct Qdisc;
+
+extern void bpf_qdisc_skb_drop(struct sk_buff *skb,
+				    struct bpf_sk_buff_ptr *to_free_list) __ksym __weak;
+extern void bpf_qdisc_bstats_update(struct Qdisc *sch, const struct sk_buff *skb) __ksym __weak;
+extern void bpf_kfree_skb(struct sk_buff *skb) __ksym __weak;
+extern __u32 bpf_skb_get_hash(struct sk_buff *) __ksym __weak;
+extern void bpf_qdisc_watchdog_schedule(struct Qdisc *sch, __u64 expire,
+		__u64 delta_ns) __ksym __weak;
+
+extern struct cgroup *bpf_cgroup_from_id(__u64 cgid) __ksym __weak;
+extern void bpf_cgroup_release(struct cgroup *cgrp) __ksym __weak;
+extern void bpf_rcu_read_lock(void) __ksym __weak;
+extern void bpf_rcu_read_unlock(void) __ksym __weak;
+extern struct cgroup *bpf_cgroup_ancestor(struct cgroup *cgrp, int level) __ksym __weak;
+
+
+extern struct bpf_rb_node *bpf_rbtree_root(struct bpf_rb_root *root) __ksym __weak;
+extern struct bpf_rb_node *bpf_rbtree_left(struct bpf_rb_root *root,
+		struct bpf_rb_node *node) __ksym __weak;
+extern struct bpf_rb_node *bpf_rbtree_right(struct bpf_rb_root *root,
+		struct bpf_rb_node *node) __ksym __weak;
+
+extern void bpf_task_release(struct task_struct *p) __ksym __weak;
+extern void __bpf_trap(void) __ksym __weak;
 
 #endif

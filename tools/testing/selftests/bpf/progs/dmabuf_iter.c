@@ -3,6 +3,7 @@
 #include <vmlinux.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
+#include "bpf_experimental.h"
 
 /* From uapi/linux/dma-buf.h */
 #define DMA_BUF_NAME_LEN 32

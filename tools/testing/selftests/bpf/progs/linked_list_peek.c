@@ -5,6 +5,7 @@
 #include <bpf/bpf_helpers.h>
 #include "bpf_misc.h"
 #include "bpf_experimental.h"
+#include "bpf_kfuncs.h"
 
 struct node_data {
 	struct bpf_list_node l;

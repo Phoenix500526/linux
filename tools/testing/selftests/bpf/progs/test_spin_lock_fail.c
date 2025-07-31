@@ -3,6 +3,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_helpers.h>
 #include "bpf_experimental.h"
+#include "bpf_kfuncs.h"
 
 struct foo {
 	struct bpf_spin_lock lock;

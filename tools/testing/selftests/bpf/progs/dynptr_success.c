@@ -8,6 +8,7 @@
 #include <bpf/bpf_tracing.h>
 #include "bpf_misc.h"
 #include "errno.h"
+#include "bpf_kfuncs.h"
 
 #define PAGE_SIZE_64K 65536
 

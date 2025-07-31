@@ -3,6 +3,7 @@
 #include <vmlinux.h>
 #include "bpf_experimental.h"
 #include "bpf_qdisc_common.h"
+#include "bpf_kfuncs.h"
 
 char _license[] SEC("license") = "GPL";
 
