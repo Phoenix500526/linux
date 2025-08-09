@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <linux/ptrace.h>
 #include <linux/kernel.h>
+#include <zlib.h>
 
 /* s8 will be marked as poison while it's a reg of riscv */
 #if defined(__riscv)
@@ -194,6 +195,7 @@
 #define USDT_NOTE_SEC  ".note.stapsdt"
 #define USDT_NOTE_TYPE 3
 #define USDT_NOTE_NAME "stapsdt"
+#define GNU_DEBUGLINK ".gnu_debuglink"
 
 /* should match exactly enum __bpf_usdt_arg_type from usdt.bpf.h */
 enum usdt_arg_type {
@@ -212,6 +214,11 @@ struct usdt_arg_spec {
 	short scale;
 	bool arg_signed;
 	char arg_bitshift;
+};
+
+struct usdt_arg_symbol {
+	char name[64];
+	int idx;
 };
 
 /* should match BPF_USDT_MAX_ARG_CNT in usdt.bpf.h */
@@ -358,6 +365,32 @@ static int sanity_check_usdt_elf(Elf *elf, const char *path)
 	return 0;
 }
 
+static size_t specs_hash_fn(long key, void *ctx)
+{
+	return str_hash((char *)key);
+}
+
+static bool specs_equal_fn(long key1, long key2, void *ctx)
+{
+	return strcmp((char *)key1, (char *)key2) == 0;
+}
+
+static int find_elf_symtab_sec(Elf *elf, GElf_Shdr *shdr, Elf_Scn **scn)
+{
+    Elf_Scn *sec = NULL;
+
+    while ((sec = elf_nextscn(elf, sec)) != NULL) {
+        if (!gelf_getshdr(sec, shdr))
+            continue;        
+        if (shdr->sh_type == SHT_SYMTAB) {
+            *scn = sec;
+            return 0;
+        }
+    }
+    
+    return -ENOENT;
+}
+
 static int find_elf_sec_by_name(Elf *elf, const char *sec_name, GElf_Shdr *shdr, Elf_Scn **scn)
 {
 	Elf_Scn *sec = NULL;
@@ -384,6 +417,271 @@ static int find_elf_sec_by_name(Elf *elf, const char *sec_name, GElf_Shdr *shdr,
 	}
 
 	return -ENOENT;
+}
+
+static bool verify_debuglink_crc32(int fd, uint32_t expected_crc)
+{
+    uint32_t crc = crc32(0L, Z_NULL, 0);  
+    unsigned char buffer[8192];
+    ssize_t bytes_read;
+
+    if (lseek(fd, 0, SEEK_SET) != 0) {
+        return false;
+    }
+
+    while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
+        crc = crc32(crc, buffer, bytes_read);
+    }
+
+    if (bytes_read < 0) {
+        return false;	
+    }
+
+    return crc == expected_crc;
+}
+
+static int find_symtab_from_elf(Elf *elf, const char *original_path, 
+                                Elf **debug_elf, int *debug_fd,
+                                GElf_Shdr *symtab_shdr, Elf_Scn **symtab_scn)
+{
+    int err, i;
+    Elf_Scn *debuglink_scn = NULL;
+    GElf_Shdr debuglink_shdr;
+    Elf_Data *debuglink_data;
+    Elf_Scn *notes_scn = NULL;
+    GElf_Shdr notes_shdr;
+    Elf_Data *notes_data;
+    GElf_Nhdr nhdr;
+    size_t name_off, desc_off, offset = 0;
+    char *debug_filename = NULL;
+    uint32_t expected_crc = 0;
+    char build_id_str[128] = {0};
+    char debug_file_path[512];
+    
+    *debug_elf = NULL;
+    *debug_fd = -1;
+    
+    err = find_elf_symtab_sec(elf, symtab_shdr, symtab_scn);
+    if (err == 0) {
+        pr_debug("found the embedded symtab in elf\n");
+        return 0;
+    }
+    
+    pr_debug("symtab is stripped, try to find out the separate debug info file\n");
+    
+    err = find_elf_sec_by_name(elf, GNU_DEBUGLINK, &debuglink_shdr, &debuglink_scn);
+    if (err != 0) {
+        pr_warn("usdt: cannot find the debuglink section in elf\n");
+        return -ENOENT;
+    }
+    
+    debuglink_data = elf_getdata(debuglink_scn, NULL);
+    if (!debuglink_data || debuglink_data->d_size < 8) {
+        pr_warn("usdt: invalid debuglink section\n");
+        return -EINVAL;
+    }
+    
+    debug_filename = (char *)debuglink_data->d_buf;
+    size_t filename_len = strlen(debug_filename);
+    size_t aligned_len = (filename_len + 4) & ~3;
+    
+    if (aligned_len + 4 > debuglink_data->d_size) {
+        printf("usdt: invalid .gnu_debuglink section format\n");
+        return -EINVAL;
+    }
+    
+    expected_crc = *(uint32_t *)((char *)debuglink_data->d_buf + aligned_len);
+    pr_debug("found debug filename: %s (expected CRC: 0x%08x)\n", debug_filename, expected_crc);
+    
+    err = find_elf_sec_by_name(elf, ".note.gnu.build-id", &notes_shdr, &notes_scn);
+    if (err != 0) {
+        pr_warn("usdt: cannot find the build-id section in elf\n");
+        return -ENOENT;
+    }
+    
+    notes_data = elf_getdata(notes_scn, NULL);
+    if (!notes_data) {
+        pr_warn("usdt: cannot read the build-id data\n");
+        return -EINVAL;
+    }
+    // parse build-id note
+    offset = 0;
+    bool found_build_id = false;
+    while ((offset = gelf_getnote(notes_data, offset, &nhdr, &name_off, &desc_off)) > 0) {
+        char *name = (char *)notes_data->d_buf + name_off;
+        
+        if (nhdr.n_type == NT_GNU_BUILD_ID && strcmp(name, "GNU") == 0) {
+            unsigned char *build_id = (unsigned char *)notes_data->d_buf + desc_off;
+            for (i = 0; i < nhdr.n_descsz; i++) {
+                snprintf(build_id_str + i * 2, 3, "%02x", build_id[i]);
+            }
+            found_build_id = true;
+            break;
+        }
+    }
+    
+    if (!found_build_id) {
+        pr_warn("usdt: cannot find the valid build-id\n");
+        return -ENOENT;
+    }
+    
+    pr_debug("found build-id: %s\n", build_id_str);
+    
+    snprintf(debug_file_path, sizeof(debug_file_path), 
+             "/usr/lib/debug/.build-id/%.2s/%s", 
+             build_id_str, debug_filename);
+    
+    pr_debug("seperated debug info file: %s\n", debug_file_path);
+    
+    if (access(debug_file_path, R_OK) != 0) {
+        pr_warn("usdt: debug info file not found: %s\n", debug_file_path);
+        return -ENOENT;
+    }
+    
+    *debug_fd = open(debug_file_path, O_RDONLY);
+    if (*debug_fd < 0) {
+        pr_warn("usdt: cannot open the debug info file: %s\n", strerror(errno));
+        return -errno;
+    }
+    
+    if (!verify_debuglink_crc32(*debug_fd, expected_crc)) {
+        pr_warn("usdt: seperated debug info file crc mismatch: expected 0x%08x\n", expected_crc);
+        close(*debug_fd);
+        *debug_fd = -1;
+        return -EINVAL;
+    }
+    
+    pr_debug("seperated debug info file crc verified: 0x%08x\n", expected_crc);
+    
+    *debug_elf = elf_begin(*debug_fd, ELF_C_READ, NULL);
+    if (!*debug_elf) {
+        pr_warn("usdt: cannot parse the debug info file: %s\n", elf_errmsg(-1));
+        close(*debug_fd);
+        *debug_fd = -1;
+        return -EINVAL;
+    }
+    
+    err = find_elf_symtab_sec(*debug_elf, symtab_shdr, symtab_scn);
+    if (err != 0) {
+        pr_warn("usdt: cannot find the symtab in the debug info file\n");
+        elf_end(*debug_elf);
+        close(*debug_fd);
+        *debug_elf = NULL;
+        *debug_fd = -1;
+        return err;
+    }
+    
+    pr_debug("found the symtab in the debug info file\n");
+    return 0;
+}
+
+
+// Helper function to clean up hashmap
+static void cleanup_symbol_map(struct hashmap *map)
+{
+    struct hashmap_entry *entry;
+    size_t bkt;
+    
+    if (!map) return;
+    
+    // Iterate through hashmap, free symbol name strings that created by strdup
+    hashmap__for_each_entry(map, entry, bkt) {
+        free((char *)entry->pkey);  
+    }
+    
+    hashmap__free(map);
+}
+
+// Get the content of the .symtab section from elf, and save the objects of type OBJECT to the hashmap
+static int parse_symtab_obj_segs(Elf *elf_to_parse, const char *path, 
+                                 GElf_Shdr *symtab_shdr, Elf_Scn *symtab_scn, 
+                                 struct hashmap **symbol_map)
+{
+    Elf_Data *symtab_data;
+    GElf_Sym sym;
+    GElf_Shdr strtab_shdr;
+    Elf_Data *strtab_data;
+    int obj_count = 0, i;
+
+    *symbol_map = hashmap__new(specs_hash_fn, specs_equal_fn, NULL);
+    if (!*symbol_map) {
+        pr_warn("usdt: could not create hashmap\n");
+        return -ENOMEM;
+    }
+
+    symtab_data = elf_getdata(symtab_scn, NULL);
+    if (!symtab_data) {
+        pr_warn("usdt: could not read symbol table data: %s\n", elf_errmsg(-1));
+        hashmap__free(*symbol_map);
+        return -EINVAL;
+    }
+    
+    // Get the corresponding string table section
+    Elf_Scn *strtab_scn = elf_getscn(elf_to_parse, symtab_shdr->sh_link);
+    if (!strtab_scn) {
+        pr_warn("usdt: could not get string table section\n");
+        hashmap__free(*symbol_map);
+        return -EINVAL;
+    }
+    
+    if (!gelf_getshdr(strtab_scn, &strtab_shdr)) {
+        pr_warn("usdt: could not get string table header info\n");
+        hashmap__free(*symbol_map);
+        return -EINVAL;
+    }
+    
+    strtab_data = elf_getdata(strtab_scn, NULL);
+    if (!strtab_data) {
+        pr_warn("usdt: could not read string table data: %s\n", elf_errmsg(-1));
+        hashmap__free(*symbol_map);
+        return -EINVAL;
+    }
+    
+    int num_symbols = symtab_shdr->sh_size / symtab_shdr->sh_entsize;
+    
+    // Iterate through symbol table, only store symbols of type OBJECT
+    for (i = 0; i < num_symbols; i++) {
+        if (!gelf_getsym(symtab_data, i, &sym)) {
+            continue;
+        }
+        
+        unsigned char sym_type = GELF_ST_TYPE(sym.st_info);
+        if (sym_type != STT_OBJECT) {
+            continue;
+        }
+        
+        const char *sym_name = (const char *)strtab_data->d_buf + sym.st_name;
+        if (!sym_name || sym_name[0] == '\0') {
+            continue;
+        }
+        
+        if (strlen(sym_name) >= 256) {
+            pr_warn("usdt: symbol name '%s' is too long, skipping\n", sym_name);
+            continue;
+        }
+                
+        // Copy symbol name, as hashmap needs persistent key
+        char *symbol_name = strdup(sym_name);
+        if (!symbol_name) {
+            pr_warn("usdt: symbol name copy failed\n");
+            hashmap__free(*symbol_map);
+            return -ENOMEM;
+        }
+        
+        // Add to hashmap
+        int err = hashmap__add(*symbol_map, symbol_name, sym.st_value);
+        if (err) {
+            free(symbol_name);
+            pr_warn("usdt: failed to add symbol to hashmap: %d\n", err);
+            cleanup_symbol_map(*symbol_map);
+            return err;
+        }
+        
+        obj_count++;
+    }
+    
+    pr_debug("total %d OBJECT type symbols found in the symtab\n", obj_count);
+    return obj_count;
 }
 
 struct elf_seg {
@@ -577,7 +875,9 @@ static int parse_usdt_note(Elf *elf, const char *path, GElf_Nhdr *nhdr,
 			   const char *data, size_t name_off, size_t desc_off,
 			   struct usdt_note *usdt_note);
 
-static int parse_usdt_spec(struct usdt_spec *spec, const struct usdt_note *note, __u64 usdt_cookie);
+static int parse_usdt_spec(struct usdt_spec *spec, const struct usdt_note *note, __u64 usdt_cookie,
+							struct usdt_arg_symbol (*sym_args)[USDT_MAX_ARG_CNT], int *sym_args_len);
+
 
 static int collect_usdt_targets(struct usdt_manager *man, Elf *elf, const char *path, pid_t pid,
 				const char *usdt_provider, const char *usdt_name, __u64 usdt_cookie,
@@ -587,12 +887,14 @@ static int collect_usdt_targets(struct usdt_manager *man, Elf *elf, const char *
 	struct elf_seg *segs = NULL, *vma_segs = NULL;
 	struct usdt_target *targets = NULL, *target;
 	long base_addr = 0;
-	Elf_Scn *notes_scn, *base_scn;
-	GElf_Shdr base_shdr, notes_shdr;
+	Elf_Scn *notes_scn, *base_scn, *symtab_scn = NULL;
+	GElf_Shdr base_shdr, notes_shdr, symtab_shdr;
 	GElf_Ehdr ehdr;
 	GElf_Nhdr nhdr;
 	Elf_Data *data;
-	int err;
+	Elf *seperated_debug_elf = NULL, *debug_elf = NULL;
+	int err, i, seperated_debug_fd = -1;
+	struct hashmap *symbol_map = NULL;
 
 	*out_targets = NULL;
 	*out_target_cnt = 0;
@@ -787,9 +1089,37 @@ static int collect_usdt_targets(struct usdt_manager *man, Elf *elf, const char *
 		 */
 		target->spec_str = note.args;
 
-		err = parse_usdt_spec(&target->spec, &note, usdt_cookie);
+		struct usdt_arg_symbol sym_args[USDT_MAX_ARG_CNT] = {0};
+		int sym_args_len = 0;
+
+		err = parse_usdt_spec(&target->spec, &note, usdt_cookie, &sym_args, &sym_args_len);
 		if (err)
 			goto err_out;
+
+		for (i = 0; i < sym_args_len; i++) {
+			if(!symbol_map) {
+				err = find_symtab_from_elf(elf, path, &seperated_debug_elf, &seperated_debug_fd, &symtab_shdr, &symtab_scn);
+				if (err != 0) {
+					pr_warn("usdt: could not find symbol table\n");
+					goto err_out;
+				}
+				debug_elf = seperated_debug_elf ? seperated_debug_elf : elf;
+				err = parse_symtab_obj_segs(debug_elf, path, &symtab_shdr, symtab_scn, &symbol_map);
+				if (err < 0) {
+					pr_warn("usdt: failed to parse symbol table\n");
+					goto err_out;
+				}
+			}
+			uint64_t symbol_addr = 0;
+			if (hashmap__find(symbol_map, sym_args[i].name, &symbol_addr)) {
+				pr_debug("usdt: found symbol '%s' (Addr: 0x%lx):\n", sym_args[i].name, symbol_addr);
+				target->spec.args[sym_args[i].idx].val_off += symbol_addr;
+			} else {
+				pr_warn("usdt: symbol '%s' not found\n", sym_args[i].name);
+				pr_warn("Hint: Ensure symbol name is correct and type is OBJECT\n");
+			}
+		}
+
 
 		target_cnt++;
 	}
@@ -803,6 +1133,13 @@ err_out:
 	free(vma_segs);
 	if (err < 0)
 		free(targets);
+	if (seperated_debug_elf) {
+		elf_end(seperated_debug_elf);
+		close(seperated_debug_fd);
+	}
+	if (symbol_map) {
+		cleanup_symbol_map(symbol_map);
+	}
 	return err;
 }
 
@@ -890,16 +1227,6 @@ static void bpf_link_usdt_dealloc(struct bpf_link *link)
 	free(usdt_link->spec_ids);
 	free(usdt_link->uprobes);
 	free(usdt_link);
-}
-
-static size_t specs_hash_fn(long key, void *ctx)
-{
-	return str_hash((char *)key);
-}
-
-static bool specs_equal_fn(long key1, long key2, void *ctx)
-{
-	return strcmp((char *)key1, (char *)key2) == 0;
 }
 
 static int allocate_spec_id(struct usdt_manager *man, struct hashmap *specs_hash,
@@ -1190,9 +1517,11 @@ static int parse_usdt_note(Elf *elf, const char *path, GElf_Nhdr *nhdr,
 	return 0;
 }
 
-static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz);
+static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz,
+					 		struct usdt_arg_symbol (*sym_args)[USDT_MAX_ARG_CNT], int *sym_args_len);
 
-static int parse_usdt_spec(struct usdt_spec *spec, const struct usdt_note *note, __u64 usdt_cookie)
+static int parse_usdt_spec(struct usdt_spec *spec, const struct usdt_note *note, __u64 usdt_cookie,
+							struct usdt_arg_symbol (*sym_args)[USDT_MAX_ARG_CNT], int *sym_args_len)
 {
 	struct usdt_arg_spec *arg;
 	const char *s;
@@ -1210,7 +1539,7 @@ static int parse_usdt_spec(struct usdt_spec *spec, const struct usdt_note *note,
 		}
 
 		arg = &spec->args[spec->arg_cnt];
-		len = parse_usdt_arg(s, spec->arg_cnt, arg, &arg_sz);
+		len = parse_usdt_arg(s, spec->arg_cnt, arg, &arg_sz, sym_args, sym_args_len);
 		if (len < 0)
 			return len;
 
@@ -1284,13 +1613,27 @@ static int calc_pt_regs_off(const char *reg_name)
 	return -ENOENT;
 }
 
-static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz)
+static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz,
+					 		struct usdt_arg_symbol (*sym_args)[USDT_MAX_ARG_CNT], int *sym_args_len)
 {
-	char reg_name[16] = {0}, idx_reg_name[16] = {0};
+	char reg_name[16] = {0}, idx_reg_name[16] = {0}, sym[64] = {0};
 	int len, reg_off, idx_reg_off, scale = 1;
 	long off = 0;
 
-	if (sscanf(arg_str, " %d @ %ld ( %%%15[^,] , %%%15[^,] , %d ) %n",
+	if (sscanf(arg_str, "%d @ %ld + %[^'(] ( %%%15[^)] ) %n", arg_sz, &off, sym, reg_name, &len) == 4
+		|| sscanf(arg_str, "%d @ %[^'(] ( %%%15[^)] ) %n", arg_sz, sym, reg_name, &len) == 3
+	) {
+		/* Memory dereference case, e.g., -4@t1(%rip), -4@4+t1(%rip) */
+		arg->arg_type = USDT_ARG_REG_DEREF;
+		arg->val_off = off;
+		reg_off = calc_pt_regs_off(reg_name);
+		if (reg_off < 0)
+			return reg_off;
+		arg->reg_off = reg_off;
+		strcpy((*sym_args)[*sym_args_len].name, sym);
+		(*sym_args)[*sym_args_len].idx = arg_num;
+		(*sym_args_len)++;
+	} else if (sscanf(arg_str, " %d @ %ld ( %%%15[^,] , %%%15[^,] , %d ) %n",
 				arg_sz, &off, reg_name, idx_reg_name, &scale, &len) == 5 ||
 		sscanf(arg_str, " %d @ ( %%%15[^,] , %%%15[^,] , %d ) %n",
 				arg_sz, reg_name, idx_reg_name, &scale, &len) == 4 ||
@@ -1360,7 +1703,8 @@ static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec
 
 /* Do not support __s390__ for now, since user_pt_regs is broken with -m31. */
 
-static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz)
+static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz,
+					 		struct usdt_arg_symbol (*sym_args)[USDT_MAX_ARG_CNT], int *sym_args_len)
 {
 	unsigned int reg;
 	int len;
@@ -1413,7 +1757,8 @@ static int calc_pt_regs_off(const char *reg_name)
 	return -ENOENT;
 }
 
-static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz)
+static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz,
+					 		struct usdt_arg_symbol (*sym_args)[USDT_MAX_ARG_CNT], int *sym_args_len)
 {
 	char reg_name[16];
 	int len, reg_off;
@@ -1507,7 +1852,8 @@ static int calc_pt_regs_off(const char *reg_name)
 	return -ENOENT;
 }
 
-static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz)
+static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz,
+					 		struct usdt_arg_symbol (*sym_args)[USDT_MAX_ARG_CNT], int *sym_args_len)
 {
 	char reg_name[16];
 	int len, reg_off;
@@ -1578,7 +1924,8 @@ static int calc_pt_regs_off(const char *reg_name)
 	return -ENOENT;
 }
 
-static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz)
+static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz,
+					 		struct usdt_arg_symbol (*sym_args)[USDT_MAX_ARG_CNT], int *sym_args_len)
 {
 	char reg_name[16];
 	int len, reg_off;
@@ -1624,7 +1971,8 @@ static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec
 
 #else
 
-static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz)
+static int parse_usdt_arg(const char *arg_str, int arg_num, struct usdt_arg_spec *arg, int *arg_sz,
+					 		struct usdt_arg_symbol (*sym_args)[USDT_MAX_ARG_CNT], int *sym_args_len)
 {
 	pr_warn("usdt: libbpf doesn't support USDTs on current architecture\n");
 	return -ENOTSUP;
